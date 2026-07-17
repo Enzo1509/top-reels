@@ -2,23 +2,28 @@
 Top Reels du Jour — Analyse automatique de Reels Instagram (comptes publics)
 =============================================================================
 1. Récupère les Reels récents des comptes listés via Apify
-2. Calcule un score de performance pour chaque Reel
-3. Envoie le Top 3 du jour dans une base Notion
+2. Charge followers.json (mis à jour chaque lundi par update_followers.py)
+3. Calcule un score de VIRALITÉ normalisé par la taille du compte
+4. Envoie le Top 3 du jour dans une base Notion
 
 Prérequis :
   pip install requests
   Variables d'environnement : APIFY_TOKEN, NOTION_TOKEN
 """
 
+import json
+import math
 import os
 import sys
 import time
+
 import requests
 from datetime import datetime, timedelta, timezone
 
 # ─────────────────────────── CONFIGURATION ───────────────────────────
 
 # Les comptes Instagram publics à surveiller (sans le @)
+# ⚠️ Vérifie : "faye.belincii" et "fayebelincii" ressemblent à un doublon
 COMPTES = [
     "gingerlilyxo",
     "brookesoftalk",
@@ -52,9 +57,22 @@ REELS_PAR_COMPTE = 10
 # Nombre de gagnants par jour
 TOP_N = 3
 
-# Clés API (à définir en variables d'environnement, jamais en dur dans le code)
-APIFY_TOKEN = os.environ["APIFY_TOKEN"]
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+# Seuil minimum de vues pour être classé.
+# Indispensable avec un score normalisé par followers : sans ce seuil,
+# un Reel à 300 vues sur un compte de 1 500 followers écraserait tout
+# le classement avec zéro signal statistique.
+MIN_VUES = 1000
+
+# Valeur de repli si un compte est absent de followers.json
+# (utilisée uniquement tant que le workflow hebdo n'a pas tourné)
+FOLLOWERS_PAR_DEFAUT = 50000
+
+# Fichier généré chaque lundi par update_followers.py
+FICHIER_FOLLOWERS = "followers.json"
+
+# Clés API (variables d'environnement, jamais en dur dans le code)
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 
 # Base Notion créée pour toi (ne pas modifier sauf si tu recrées la base)
 NOTION_DATABASE_ID = "a57b8dd142444d65a2e8849f09f31456"
@@ -63,6 +81,43 @@ NOTION_DATABASE_ID = "a57b8dd142444d65a2e8849f09f31456"
 APIFY_ACTOR = "apify~instagram-reel-scraper"
 
 RANGS = ["🥇 1er", "🥈 2ème", "🥉 3ème", "4ème", "5ème"]
+
+# ─────────────────────────── 0. FOLLOWERS ───────────────────────────
+
+def charger_followers():
+    """Charge followers.json → {username_minuscule: followersCount}."""
+    if not os.path.exists(FICHIER_FOLLOWERS):
+        print(f"⚠️  {FICHIER_FOLLOWERS} introuvable — valeur par défaut "
+              f"({FOLLOWERS_PAR_DEFAUT:,}) utilisée pour tous les comptes.")
+        print("   → Lance le workflow « Mise à jour followers » dans GitHub Actions.")
+        return {}
+
+    try:
+        with open(FICHIER_FOLLOWERS, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"⚠️  {FICHIER_FOLLOWERS} illisible ({e}) — valeurs par défaut utilisées.")
+        return {}
+
+    followers = {k.strip().lower(): int(v) for k, v in data.items()
+                 if isinstance(v, (int, float)) and v > 0}
+    print(f"→ {len(followers)} comptes chargés depuis {FICHIER_FOLLOWERS}")
+    return followers
+
+
+def followers_de(username, followers_map):
+    """Retourne le nombre de followers d'un compte, avec repli intelligent."""
+    count = followers_map.get(username.strip().lower())
+    if count:
+        return count, True
+
+    # Repli : médiane des comptes connus, sinon valeur par défaut
+    if followers_map:
+        valeurs = sorted(followers_map.values())
+        mediane = valeurs[len(valeurs) // 2]
+        return mediane, False
+    return FOLLOWERS_PAR_DEFAUT, False
+
 
 # ─────────────────────────── 1. SCRAPING APIFY ───────────────────────────
 
@@ -89,10 +144,44 @@ def recuperer_reels():
 
 # ─────────────────────────── 2. SCORING ───────────────────────────
 
-def analyser(items):
-    """Filtre les Reels récents et calcule leur score."""
-    limite = datetime.now(timezone.utc) - timedelta(hours=FENETRE_HEURES)
+def calculer_score(vues, likes, comms, followers, heures_ecoulees):
+    """
+    Score de viralité normalisé par la taille du compte.
+
+    ratio       = vues / followers        → performance relative au compte
+    engagement  = (likes + 3×comms)/vues  → les commentaires pèsent 3× plus
+                                            (signal d'accroche bien plus fort
+                                            qu'un like passif)
+    log10(vues+10)                        → récompense le volume absolu, en
+                                            douceur, pour départager deux
+                                            ratios proches
+    facteur récence                       → un Reel posté il y a 4h qui a déjà
+                                            explosé bat un Reel posté il y a
+                                            22h aux mêmes stats (vélocité)
+
+    Le score final n'a pas d'unité — il sert uniquement à classer.
+    """
+    if not vues or not followers:
+        return 0.0, 0.0, 0.0
+
+    ratio = vues / followers
+    engagement_pondere = (likes + 3 * comms) / vues
+
+    # Facteur de récence borné : sqrt(24 / heures), plafonné à 2.0
+    # (un Reel posté il y a 1h ne doit pas ×5 son score sur 200 vues de data)
+    heures = max(heures_ecoulees, 3.0)  # plancher 3h pour lisser le bruit
+    facteur_recence = min(math.sqrt(FENETRE_HEURES / heures), 2.0)
+
+    score = ratio * (1 + engagement_pondere * 5) * math.log10(vues + 10) * facteur_recence
+    return round(score, 3), round(ratio, 3), engagement_pondere
+
+
+def analyser(items, followers_map):
+    """Filtre les Reels récents et calcule leur score de viralité."""
+    maintenant = datetime.now(timezone.utc)
+    limite = maintenant - timedelta(hours=FENETRE_HEURES)
     reels = []
+    ignores_vues = 0
 
     for item in items:
         # Date de publication
@@ -110,30 +199,44 @@ def analyser(items):
         likes = item.get("likesCount") or 0
         comms = item.get("commentsCount") or 0
 
-        engagement = round((likes + comms) / vues * 100, 2) if vues else 0.0
+        if vues < MIN_VUES:
+            ignores_vues += 1
+            continue  # trop peu de vues pour un signal fiable
 
-        # Score : les vues comptent, mais l'engagement est fortement valorisé
-        # (un Reel avec bcp d'interactions par vue = contenu qui accroche)
-        score = round(vues * (1 + (engagement / 100) * 5))
+        compte = item.get("ownerUsername", "?")
+        followers, followers_connus = followers_de(compte, followers_map)
+        heures_ecoulees = (maintenant - date_pub).total_seconds() / 3600
+
+        engagement_simple = round((likes + comms) / vues * 100, 2)
+        score, ratio, _ = calculer_score(vues, likes, comms, followers, heures_ecoulees)
 
         reels.append({
-            "compte": item.get("ownerUsername", "?"),
+            "compte": compte,
             "lien": item.get("url", ""),
             "vues": vues,
             "likes": likes,
             "commentaires": comms,
-            "engagement": engagement,
+            "engagement": engagement_simple,
+            "followers": followers,
+            "followers_estimes": not followers_connus,
+            "ratio": ratio,
             "score": score,
             "legende": (item.get("caption") or "")[:150],
             "date": date_pub,
         })
 
     reels.sort(key=lambda r: r["score"], reverse=True)
-    print(f"→ {len(reels)} Reels publiés dans les {FENETRE_HEURES} dernières heures")
+    print(f"→ {len(reels)} Reels retenus ({ignores_vues} ignorés sous {MIN_VUES:,} vues) "
+          f"dans les {FENETRE_HEURES} dernières heures")
     return reels[:TOP_N]
 
 
 # ─────────────────────────── 3. ENVOI VERS NOTION ───────────────────────────
+
+# Propriétés ajoutées par la V2 — si elles n'existent pas encore dans ta base
+# Notion, le script réessaie automatiquement sans elles (voir README).
+PROPRIETES_V2 = ("Followers", "Vues/Follower")
+
 
 def envoyer_notion(top_reels):
     """Crée une page Notion par Reel gagnant."""
@@ -145,26 +248,40 @@ def envoyer_notion(top_reels):
     }
 
     for i, reel in enumerate(top_reels):
+        suffixe = " (est.)" if reel["followers_estimes"] else ""
         titre = f"@{reel['compte']} — {reel['legende'][:60] or 'Reel'}"
-        page = {
-            "parent": {"database_id": NOTION_DATABASE_ID},
-            "properties": {
-                "Reel": {"title": [{"text": {"content": titre}}]},
-                "Date": {"date": {"start": aujourd_hui}},
-                "Rang": {"select": {"name": RANGS[i]}},
-                "Compte": {"rich_text": [{"text": {"content": "@" + reel["compte"]}}]},
-                "Lien": {"url": reel["lien"] or None},
-                "Vues": {"number": reel["vues"]},
-                "Likes": {"number": reel["likes"]},
-                "Commentaires": {"number": reel["commentaires"]},
-                "Engagement %": {"number": reel["engagement"]},
-                "Score": {"number": reel["score"]},
-                "Légende": {"rich_text": [{"text": {"content": reel["legende"]}}]},
-            },
+        proprietes = {
+            "Reel": {"title": [{"text": {"content": titre}}]},
+            "Date": {"date": {"start": aujourd_hui}},
+            "Rang": {"select": {"name": RANGS[i]}},
+            "Compte": {"rich_text": [{"text": {"content": "@" + reel["compte"] + suffixe}}]},
+            "Lien": {"url": reel["lien"] or None},
+            "Vues": {"number": reel["vues"]},
+            "Likes": {"number": reel["likes"]},
+            "Commentaires": {"number": reel["commentaires"]},
+            "Engagement %": {"number": reel["engagement"]},
+            "Score": {"number": reel["score"]},
+            "Légende": {"rich_text": [{"text": {"content": reel["legende"]}}]},
+            # Nouvelles propriétés V2
+            "Followers": {"number": reel["followers"]},
+            "Vues/Follower": {"number": reel["ratio"]},
         }
+        page = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": proprietes}
+
         r = requests.post("https://api.notion.com/v1/pages", headers=headers, json=page, timeout=30)
+
+        # Si la base Notion n'a pas encore les nouvelles colonnes → retry sans elles
+        if r.status_code == 400 and any(p in r.text for p in PROPRIETES_V2):
+            for p in PROPRIETES_V2:
+                proprietes.pop(p, None)
+            print(f"   ⚠️  Colonnes {PROPRIETES_V2} absentes de la base Notion — envoi sans elles "
+                  f"(ajoute-les pour voir le ratio, cf. README)")
+            r = requests.post("https://api.notion.com/v1/pages", headers=headers, json=page, timeout=30)
+
         if r.status_code == 200:
-            print(f"   ✅ {RANGS[i]} : @{reel['compte']} ({reel['vues']:,} vues, score {reel['score']:,})")
+            print(f"   ✅ {RANGS[i]} : @{reel['compte']} — {reel['vues']:,} vues / "
+                  f"{reel['followers']:,} followers{suffixe} → ratio {reel['ratio']}, "
+                  f"score {reel['score']}")
         else:
             print(f"   ❌ Erreur Notion pour @{reel['compte']} : {r.status_code} {r.text[:200]}")
         time.sleep(0.4)  # respecter le rate limit Notion
@@ -173,8 +290,13 @@ def envoyer_notion(top_reels):
 # ─────────────────────────── MAIN ───────────────────────────
 
 if __name__ == "__main__":
+    if not APIFY_TOKEN or not NOTION_TOKEN:
+        print("❌ Variables d'environnement APIFY_TOKEN et NOTION_TOKEN requises.")
+        sys.exit(1)
+
+    followers_map = charger_followers()
     items = recuperer_reels()
-    top = analyser(items)
+    top = analyser(items, followers_map)
 
     if not top:
         print("Aucun Reel publié dans la fenêtre d'analyse. Rien à envoyer.")
