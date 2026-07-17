@@ -1,1 +1,42 @@
+name: Mise à jour followers (hebdo)
 
+on:
+  schedule:
+    # Tous les lundis à 06:00 UTC (avant le run quotidien de 20:00)
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # nécessaire pour committer followers.json
+
+jobs:
+  update-followers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Mettre à jour followers.json
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+        run: python update_followers.py
+
+      - name: Committer followers.json si modifié
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add followers.json
+          if git diff --staged --quiet; then
+            echo "Aucun changement dans followers.json"
+          else
+            git commit -m "chore: mise à jour hebdomadaire de followers.json"
+            git push
+          fi
