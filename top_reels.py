@@ -48,11 +48,23 @@ COMPTES = [
     "ambeerrspamm_",
 ]
 
-# Fenêtre d'analyse : Reels publiés dans les X dernières heures
-FENETRE_HEURES = 24
+# Fenêtre d'analyse : Reels publiés entre [J-2 20:00 UTC → J-1 20:00 UTC].
+# La fenêtre est ancrée sur HEURE_ANCRAGE (l'heure du cron), PAS sur l'heure
+# réelle du run : même si GitHub Actions lance le cron avec 40 min de retard
+# (fréquent), les bornes ne bougent pas → chaque Reel est analysé exactement
+# une fois, et a toujours entre 24h et 48h de vie au moment du scoring.
+# ⚠️ Doit correspondre à l'heure du cron quotidien dans le workflow GitHub.
+HEURE_ANCRAGE = 20  # 20:00 UTC
 
-# Nombre de Reels max récupérés par compte (impacte le coût Apify)
-REELS_PAR_COMPTE = 10
+# Référence pour le facteur de vélocité (24h = une journée de vie)
+HEURES_REFERENCE = 24
+
+# Nombre de Reels max récupérés par compte (impacte le coût Apify).
+# ⚠️ L'acteur renvoie les Reels les plus RÉCENTS en premier : les Reels
+# de 0-24h (hors fenêtre) consomment des slots avant d'atteindre ceux de
+# 24-48h qu'on veut analyser. Sur un compte qui poste 5 Reels/jour, il
+# faut ~10 slots rien que pour traverser les dernières 48h → 15 par sécurité.
+REELS_PAR_COMPTE = 15
 
 # Nombre de gagnants par jour
 TOP_N = 3
@@ -167,19 +179,44 @@ def calculer_score(vues, likes, comms, followers, heures_ecoulees):
     ratio = vues / followers
     engagement_pondere = (likes + 3 * comms) / vues
 
-    # Facteur de récence borné : sqrt(24 / heures), plafonné à 2.0
-    # (un Reel posté il y a 1h ne doit pas ×5 son score sur 200 vues de data)
-    heures = max(heures_ecoulees, 3.0)  # plancher 3h pour lisser le bruit
-    facteur_recence = min(math.sqrt(FENETRE_HEURES / heures), 2.0)
+    # Facteur de vélocité : sqrt(24 / heures), plafonné à 2.0.
+    # Avec la fenêtre ancrée 24-48h, l'âge des Reels au moment du run va de
+    # ~24h à ~48h. Le facteur compense le fait qu'un Reel posté en fin de
+    # fenêtre a eu moins de temps pour accumuler ses vues : à vues égales,
+    # le plus récent a une vélocité supérieure et mérite un meilleur score.
+    heures = max(heures_ecoulees, 3.0)  # plancher de sécurité
+    facteur_recence = min(math.sqrt(HEURES_REFERENCE / heures), 2.0)
 
     score = ratio * (1 + engagement_pondere * 5) * math.log10(vues + 10) * facteur_recence
     return round(score, 3), round(ratio, 3), engagement_pondere
 
 
-def analyser(items, followers_map):
-    """Filtre les Reels récents et calcule leur score de viralité."""
+def fenetre_analyse():
+    """Retourne (début, fin) = [J-2 HEURE_ANCRAGE → J-1 HEURE_ANCRAGE] en UTC.
+
+    Concrètement : run du 18/07 à 20:05 (ou 20:47, ou même 23:00)
+      → fin   = 17/07 20:00
+      → début = 16/07 20:00
+    Tout Reel de cette fenêtre a donc AU MINIMUM 24h de vie (posté au plus
+    tard le 17 à 20:00, run au plus tôt le 18 à 20:00) et au maximum ~48h.
+    Les bornes étant ancrées sur HEURE_ANCRAGE et non sur l'heure réelle du
+    run, deux runs quotidiens successifs couvrent des fenêtres parfaitement
+    disjointes et contiguës, quel que soit le retard du cron GitHub.
+    """
     maintenant = datetime.now(timezone.utc)
-    limite = maintenant - timedelta(hours=FENETRE_HEURES)
+    ancre = maintenant.replace(hour=HEURE_ANCRAGE, minute=0, second=0, microsecond=0)
+    if ancre > maintenant:
+        # Run lancé avant HEURE_ANCRAGE (ex. run manuel le matin)
+        ancre -= timedelta(days=1)
+    fin = ancre - timedelta(days=1)      # J-1 à 20:00
+    debut = fin - timedelta(days=1)      # J-2 à 20:00
+    return debut, fin
+
+
+def analyser(items, followers_map):
+    """Garde les Reels de la fenêtre 24-48h et calcule leur score de viralité."""
+    maintenant = datetime.now(timezone.utc)
+    debut, fin = fenetre_analyse()
     reels = []
     ignores_vues = 0
 
@@ -192,8 +229,8 @@ def analyser(items, followers_map):
             date_pub = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if date_pub < limite:
-            continue  # trop ancien
+        if not (debut <= date_pub < fin):
+            continue  # hors fenêtre 24-48h
 
         vues = item.get("videoPlayCount") or item.get("videoViewCount") or 0
         likes = item.get("likesCount") or 0
@@ -227,7 +264,7 @@ def analyser(items, followers_map):
 
     reels.sort(key=lambda r: r["score"], reverse=True)
     print(f"→ {len(reels)} Reels retenus ({ignores_vues} ignorés sous {MIN_VUES:,} vues) "
-          f"dans les {FENETRE_HEURES} dernières heures")
+          f"dans la fenêtre {debut.strftime('%d/%m %H:%M')} → {fin.strftime('%d/%m %H:%M')} UTC")
     return reels[:TOP_N]
 
 
@@ -239,8 +276,14 @@ PROPRIETES_V2 = ("Followers", "Vues/Follower")
 
 
 def envoyer_notion(top_reels):
-    """Crée une page Notion par Reel gagnant."""
-    aujourd_hui = datetime.now().strftime("%Y-%m-%d")
+    """Crée une page Notion par Reel gagnant.
+
+    La colonne Date reçoit la date de fin de la fenêtre analysée (fenêtre
+    J-2 20:00 → J-1 20:00, étiquetée J-1) : chaque run quotidien produit
+    ainsi une date unique et cohérente, même s'il tourne en retard.
+    """
+    _, fin_fenetre = fenetre_analyse()
+    jour_analyse = fin_fenetre.strftime("%Y-%m-%d")
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": "2022-06-28",
@@ -252,7 +295,7 @@ def envoyer_notion(top_reels):
         titre = f"@{reel['compte']} — {reel['legende'][:60] or 'Reel'}"
         proprietes = {
             "Reel": {"title": [{"text": {"content": titre}}]},
-            "Date": {"date": {"start": aujourd_hui}},
+            "Date": {"date": {"start": jour_analyse}},
             "Rang": {"select": {"name": RANGS[i]}},
             "Compte": {"rich_text": [{"text": {"content": "@" + reel["compte"] + suffixe}}]},
             "Lien": {"url": reel["lien"] or None},
