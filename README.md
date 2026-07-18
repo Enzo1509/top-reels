@@ -11,6 +11,8 @@ Lundi 06:00 UTC   : Apify (profile-scraper) → update_followers.py → follower
 Chaque jour 20:00 : Apify (reel-scraper)    → top_reels.py (scoring) → Notion (Top 3)
 ```
 
+**Fenêtre d'analyse (V2.1)** : chaque run analyse les Reels publiés entre **avant-hier 20:00 UTC et hier 20:00 UTC**. Au moment du run (20:00), chaque Reel a donc entre **24h et 48h de vie** — assez pour que ses stats soient stabilisées et comparables. Les bornes sont ancrées sur 20:00 UTC pile (variable `HEURE_ANCRAGE`), pas sur l'heure réelle du run : même si GitHub Actions lance le cron avec 40 min de retard (fréquent), aucun Reel n'est jamais analysé deux fois ni oublié. ⚠️ Si tu changes l'heure du cron quotidien dans le workflow, mets `HEURE_ANCRAGE` en cohérence.
+
 ## La formule de score V2
 
 ```
@@ -85,8 +87,9 @@ python top_reels.py          # chaque jour
 
 | Variable | Rôle | Défaut |
 |---|---|---|
-| `FENETRE_HEURES` | Ne garder que les Reels publiés dans les X dernières heures | 24 |
-| `REELS_PAR_COMPTE` | Nombre de Reels scrapés par compte (coût Apify) | 10 |
+| `HEURE_ANCRAGE` | Borne fixe de la fenêtre 24-48h (= heure du cron, UTC) | 20 |
+| `HEURES_REFERENCE` | Référence du facteur de vélocité (24h = une journée) | 24 |
+| `REELS_PAR_COMPTE` | Nombre de Reels scrapés par compte (coût Apify) | 15 |
 | `TOP_N` | Nombre de gagnants envoyés dans Notion | 3 |
 | `MIN_VUES` | Seuil minimum de vues pour être classé | 1000 |
 | `FOLLOWERS_PAR_DEFAUT` | Repli si `followers.json` absent | 50000 |
